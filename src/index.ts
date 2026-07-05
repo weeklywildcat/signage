@@ -7,6 +7,29 @@ type StoredStatusRow = {
   updated_by: string;
 };
 
+type ScheduleRow = {
+  opens_at: string | null;
+  time_value: string | null;
+};
+
+type OpeningTimePreset = {
+  id: number;
+  timeValue: string;
+  label: string;
+};
+
+type OpeningTimePresetRow = {
+  id: number;
+  time_value: string;
+  label: string;
+};
+
+type ScheduledOpen = {
+  opensAt: string;
+  timeValue: string;
+  label: string;
+};
+
 type StatusCopy = {
   label: string;
   sentence: string;
@@ -24,6 +47,8 @@ type ApiStatus = {
   updatedAt: string;
   updatedBy: string;
   isStale: boolean;
+  scheduledOpen: ScheduledOpen | null;
+  openingTimePresets: OpeningTimePreset[];
   timezone: "America/New_York";
   generatedAt: string;
 };
@@ -76,7 +101,7 @@ export default {
 
       if (pathname === "/api/status") {
         return request.method === "GET"
-          ? json(await getEffectiveStatus(env))
+          ? json(await getEffectiveStatus(env, false))
           : methodNotAllowed(["GET"]);
       }
 
@@ -86,7 +111,7 @@ export default {
 
       if (pathname === "/manage/api/status") {
         if (request.method === "GET") {
-          return json(await getEffectiveStatus(env));
+          return json(await getEffectiveStatus(env, true));
         }
 
         if (request.method === "POST") {
@@ -148,23 +173,68 @@ async function updateStatus(request: Request, env: Env): Promise<Response> {
   const updatedAt = new Date().toISOString();
   const updatedBy =
     request.headers.get("CF-Access-Authenticated-User-Email")?.trim() || "Library staff";
+  const scheduledOpenTimeValue = body.scheduledOpenTime;
+  const saveOpeningTimeValue = body.saveOpeningTime;
 
-  await env.SIGNAGE_DB.batch([
+  if (
+    scheduledOpenTimeValue !== undefined &&
+    scheduledOpenTimeValue !== null &&
+    typeof scheduledOpenTimeValue !== "string"
+  ) {
+    return json({ error: "Scheduled open time must be a time string." }, 400);
+  }
+
+  if (saveOpeningTimeValue !== undefined && typeof saveOpeningTimeValue !== "boolean") {
+    return json({ error: "Save opening time must be true or false." }, 400);
+  }
+
+  const saveOpeningTime = saveOpeningTimeValue === true;
+  const scheduledOpen =
+    status === "open" || !scheduledOpenTimeValue
+      ? null
+      : resolveScheduledOpenTime(scheduledOpenTimeValue, new Date());
+
+  if (scheduledOpenTimeValue && scheduledOpen === null) {
+    return json({ error: "Scheduled open time must be later today." }, 400);
+  }
+
+  if (saveOpeningTime && scheduledOpen === null) {
+    return json({ error: "Choose a scheduled open time before saving it." }, 400);
+  }
+
+  await ensureScheduleTables(env);
+
+  const statements = [
     env.SIGNAGE_DB.prepare(
       "UPDATE library_status SET status = ?, message = ?, updated_at = ?, updated_by = ? WHERE id = 1",
     ).bind(status, message, updatedAt, updatedBy),
     env.SIGNAGE_DB.prepare(
       "INSERT INTO library_status_history (status, message, updated_at, updated_by) VALUES (?, ?, ?, ?)",
     ).bind(status, message, updatedAt, updatedBy),
-  ]);
+    env.SIGNAGE_DB.prepare(
+      "INSERT INTO library_open_schedule (id, opens_at, time_value, updated_at, updated_by) VALUES (1, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET opens_at = excluded.opens_at, time_value = excluded.time_value, updated_at = excluded.updated_at, updated_by = excluded.updated_by",
+    ).bind(scheduledOpen?.opensAt ?? null, scheduledOpen?.timeValue ?? null, updatedAt, updatedBy),
+  ];
+
+  if (saveOpeningTime && scheduledOpen !== null) {
+    statements.push(
+      env.SIGNAGE_DB.prepare(
+        "INSERT INTO library_opening_presets (time_value, label, created_at, created_by) VALUES (?, ?, ?, ?) ON CONFLICT(time_value) DO UPDATE SET label = excluded.label",
+      ).bind(scheduledOpen.timeValue, scheduledOpen.label, updatedAt, updatedBy),
+    );
+  }
+
+  await env.SIGNAGE_DB.batch(statements);
 
   return json({
     ok: true,
-    status: await getEffectiveStatus(env),
+    status: await getEffectiveStatus(env, true),
   });
 }
 
-async function getEffectiveStatus(env: Env): Promise<ApiStatus> {
+async function getEffectiveStatus(env: Env, includePresets: boolean): Promise<ApiStatus> {
+  await ensureScheduleTables(env);
+
   const row = await env.SIGNAGE_DB.prepare(
     "SELECT status, message, updated_at, updated_by FROM library_status WHERE id = 1",
   ).first<StoredStatusRow>();
@@ -178,6 +248,8 @@ async function getEffectiveStatus(env: Env): Promise<ApiStatus> {
   const isStale = !isSameNewYorkDate(updatedAt, now);
   const effectiveStatus: Status = isStale ? "closed" : storedStatus;
   const copy = STATUS_COPY[effectiveStatus];
+  const scheduledOpen = isStale ? null : await getScheduledOpen(env, now);
+  const openingTimePresets = includePresets ? await getOpeningTimePresets(env) : [];
 
   return {
     status: effectiveStatus,
@@ -190,9 +262,58 @@ async function getEffectiveStatus(env: Env): Promise<ApiStatus> {
     updatedAt,
     updatedBy,
     isStale,
+    scheduledOpen,
+    openingTimePresets,
     timezone: TIMEZONE,
     generatedAt: now.toISOString(),
   };
+}
+
+async function ensureScheduleTables(env: Env): Promise<void> {
+  await env.SIGNAGE_DB.batch([
+    env.SIGNAGE_DB.prepare(
+      "CREATE TABLE IF NOT EXISTS library_open_schedule (id INTEGER PRIMARY KEY CHECK (id = 1), opens_at TEXT, time_value TEXT, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL)",
+    ),
+    env.SIGNAGE_DB.prepare(
+      "CREATE TABLE IF NOT EXISTS library_opening_presets (id INTEGER PRIMARY KEY AUTOINCREMENT, time_value TEXT NOT NULL UNIQUE, label TEXT NOT NULL, created_at TEXT NOT NULL, created_by TEXT NOT NULL)",
+    ),
+    env.SIGNAGE_DB.prepare(
+      "INSERT INTO library_open_schedule (id, opens_at, time_value, updated_at, updated_by) VALUES (1, NULL, NULL, ?, 'Library staff') ON CONFLICT(id) DO NOTHING",
+    ).bind(new Date().toISOString()),
+  ]);
+}
+
+async function getScheduledOpen(env: Env, now: Date): Promise<ScheduledOpen | null> {
+  const row = await env.SIGNAGE_DB.prepare(
+    "SELECT opens_at, time_value FROM library_open_schedule WHERE id = 1",
+  ).first<ScheduleRow>();
+
+  if (!row?.opens_at || !row.time_value) {
+    return null;
+  }
+
+  const opensAtDate = new Date(row.opens_at);
+  if (Number.isNaN(opensAtDate.getTime()) || opensAtDate.getTime() <= now.getTime()) {
+    return null;
+  }
+
+  return {
+    opensAt: opensAtDate.toISOString(),
+    timeValue: row.time_value,
+    label: formatTimeValue(row.time_value),
+  };
+}
+
+async function getOpeningTimePresets(env: Env): Promise<OpeningTimePreset[]> {
+  const result = await env.SIGNAGE_DB.prepare(
+    "SELECT id, time_value, label FROM library_opening_presets ORDER BY time_value ASC",
+  ).all<OpeningTimePresetRow>();
+
+  return result.results.map((row) => ({
+    id: row.id,
+    timeValue: row.time_value,
+    label: row.label,
+  }));
 }
 
 function isSameNewYorkDate(isoTimestamp: string, now: Date): boolean {
@@ -202,6 +323,83 @@ function isSameNewYorkDate(isoTimestamp: string, now: Date): boolean {
   }
 
   return newYorkDateKey(updated) === newYorkDateKey(now);
+}
+
+function resolveScheduledOpenTime(timeValue: string, now: Date): ScheduledOpen | null {
+  const normalizedTime = normalizeTimeValue(timeValue);
+  if (normalizedTime === null) {
+    return null;
+  }
+
+  const opensAt = newYorkDateTimeToUtc(newYorkDateKey(now), normalizedTime);
+  if (opensAt.getTime() <= now.getTime()) {
+    return null;
+  }
+
+  return {
+    opensAt: opensAt.toISOString(),
+    timeValue: normalizedTime,
+    label: formatTimeValue(normalizedTime),
+  };
+}
+
+function normalizeTimeValue(timeValue: string): string | null {
+  const match = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(timeValue.trim());
+  if (match === null) {
+    return null;
+  }
+
+  return `${match[1]}:${match[2]}`;
+}
+
+function formatTimeValue(timeValue: string): string {
+  const normalizedTime = normalizeTimeValue(timeValue);
+  if (normalizedTime === null) {
+    return timeValue;
+  }
+
+  const [hourPart, minutePart] = normalizedTime.split(":");
+  const hour = Number(hourPart);
+  const suffix = hour >= 12 ? "PM" : "AM";
+  const hour12 = hour % 12 || 12;
+  return `${hour12}:${minutePart} ${suffix}`;
+}
+
+function newYorkDateTimeToUtc(dateKey: string, timeValue: string): Date {
+  const [year, month, day] = dateKey.split("-").map(Number);
+  const [hour, minute] = timeValue.split(":").map(Number);
+  let utcMillis = Date.UTC(year, month - 1, day, hour, minute);
+
+  for (let index = 0; index < 2; index += 1) {
+    utcMillis = Date.UTC(year, month - 1, day, hour, minute) - getNewYorkOffsetMillis(new Date(utcMillis));
+  }
+
+  return new Date(utcMillis);
+}
+
+function getNewYorkOffsetMillis(date: Date): number {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: TIMEZONE,
+    hourCycle: "h23",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).formatToParts(date);
+
+  const getPart = (type: string): number => Number(parts.find((part) => part.type === type)?.value ?? "0");
+  const asUtcMillis = Date.UTC(
+    getPart("year"),
+    getPart("month") - 1,
+    getPart("day"),
+    getPart("hour"),
+    getPart("minute"),
+    getPart("second"),
+  );
+
+  return asUtcMillis - date.getTime();
 }
 
 function newYorkDateKey(date: Date): string {
@@ -409,6 +607,69 @@ function viewHtml(): string {
       display: block;
     }
 
+    .countdown {
+      display: none;
+      margin-top: clamp(20px, 2.4vw, 40px);
+      color: var(--accent);
+      text-align: center;
+    }
+
+    .countdown[data-visible="true"] {
+      display: block;
+    }
+
+    .countdown-label {
+      color: var(--muted);
+      font-size: clamp(24px, 2.2vw, 44px);
+      font-weight: 850;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .countdown-value {
+      margin-top: clamp(4px, 0.7vw, 12px);
+      font-size: clamp(64px, 7vw, 132px);
+      line-height: 0.95;
+      font-weight: 950;
+      letter-spacing: 0;
+    }
+
+    .countdown-time {
+      margin-top: clamp(6px, 0.8vw, 14px);
+      color: var(--muted);
+      font-size: clamp(20px, 1.8vw, 34px);
+      font-weight: 800;
+    }
+
+    [data-countdown="true"] h1 {
+      font-size: clamp(84px, 10vw, 180px);
+    }
+
+    [data-countdown="true"] .status {
+      font-size: clamp(92px, 11vw, 198px);
+    }
+
+    [data-countdown="true"] .message {
+      font-size: clamp(30px, 2.8vw, 52px);
+      margin-top: clamp(14px, 1.6vw, 26px);
+    }
+
+    [data-countdown="true"] .countdown {
+      margin-top: clamp(14px, 1.8vw, 30px);
+    }
+
+    [data-countdown="true"] .countdown-value {
+      font-size: clamp(58px, 5.8vw, 110px);
+    }
+
+    [data-countdown="true"] .countdown-time {
+      font-size: clamp(18px, 1.5vw, 28px);
+    }
+
+    [data-countdown="true"] .updated {
+      font-size: clamp(16px, 1.4vw, 26px);
+    }
+
     .symbol {
       display: none;
     }
@@ -474,6 +735,11 @@ function viewHtml(): string {
         <div class="status" id="status-label">CLOSED</div>
         <div class="sentence" id="sentence">The library is unavailable during lunch.</div>
         <div class="message" id="message"></div>
+        <div class="countdown" id="countdown">
+          <div class="countdown-label">Opening In</div>
+          <div class="countdown-value" id="countdown-value"></div>
+          <div class="countdown-time" id="countdown-time"></div>
+        </div>
       </section>
       <div class="symbol" id="symbol" aria-hidden="true"></div>
     </main>
@@ -483,6 +749,9 @@ function viewHtml(): string {
     </footer>
   </div>
   <script>
+    let countdownTarget = null;
+    let countdownLabel = '';
+
     const iconMap = {
       check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>',
       pause: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M6 5v14"/><path d="M18 5v14"/></svg>',
@@ -519,6 +788,10 @@ function viewHtml(): string {
       message.textContent = data.message || '';
       message.dataset.visible = data.message ? 'true' : 'false';
 
+      countdownTarget = data.scheduledOpen ? new Date(data.scheduledOpen.opensAt) : null;
+      countdownLabel = data.scheduledOpen ? data.scheduledOpen.label : '';
+      updateCountdown();
+
       const updated = new Date(data.updatedAt);
       const updatedText = Number.isNaN(updated.getTime())
         ? 'Last updated unavailable'
@@ -538,6 +811,7 @@ function viewHtml(): string {
           sentence: 'The library is unavailable during lunch.',
           icon: 'x',
           message: '',
+          scheduledOpen: null,
           updatedAt: '',
           isStale: false,
         });
@@ -545,9 +819,49 @@ function viewHtml(): string {
       }
     }
 
+    function updateCountdown() {
+      const countdown = document.getElementById('countdown');
+      const value = document.getElementById('countdown-value');
+      const time = document.getElementById('countdown-time');
+
+      if (!(countdownTarget instanceof Date) || Number.isNaN(countdownTarget.getTime())) {
+        document.body.dataset.countdown = 'false';
+        countdown.dataset.visible = 'false';
+        value.textContent = '';
+        time.textContent = '';
+        return;
+      }
+
+      const remainingMs = countdownTarget.getTime() - Date.now();
+      if (remainingMs <= 0) {
+        document.body.dataset.countdown = 'false';
+        countdown.dataset.visible = 'false';
+        value.textContent = '';
+        time.textContent = '';
+        return;
+      }
+
+      const totalSeconds = Math.ceil(remainingMs / 1000);
+      const hours = Math.floor(totalSeconds / 3600);
+      const minutes = Math.floor((totalSeconds % 3600) / 60);
+      const seconds = totalSeconds % 60;
+
+      document.body.dataset.countdown = 'true';
+      countdown.dataset.visible = 'true';
+      if (hours > 0) {
+        value.textContent = hours + 'h ' + String(minutes).padStart(2, '0') + 'm';
+      } else if (minutes > 0) {
+        value.textContent = minutes + ' min';
+      } else {
+        value.textContent = seconds + ' sec';
+      }
+      time.textContent = 'Scheduled for ' + countdownLabel;
+    }
+
     updateClock();
     refresh();
     setInterval(updateClock, 15000);
+    setInterval(updateCountdown, 1000);
     setInterval(refresh, 20000);
   </script>
 </body>
@@ -729,6 +1043,49 @@ function manageHtml(): string {
       line-height: 1.4;
     }
 
+    select,
+    input[type="time"] {
+      width: 100%;
+      min-height: 48px;
+      margin-top: 8px;
+      padding: 0 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #ffffff;
+      color: var(--ink);
+      font: inherit;
+      font-weight: 700;
+    }
+
+    select:focus-visible,
+    input[type="time"]:focus-visible {
+      outline: 3px solid var(--focus);
+      outline-offset: 2px;
+    }
+
+    .schedule-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(150px, 0.5fr);
+      gap: 12px;
+      align-items: end;
+    }
+
+    .check-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 12px;
+      color: var(--muted);
+      font-size: 14px;
+      font-weight: 750;
+    }
+
+    .check-row input {
+      width: 18px;
+      height: 18px;
+      accent-color: var(--ink);
+    }
+
     .field-row {
       display: flex;
       justify-content: space-between;
@@ -878,6 +1235,10 @@ function manageHtml(): string {
         grid-template-columns: 1fr;
       }
 
+      .schedule-grid {
+        grid-template-columns: 1fr;
+      }
+
       .status-button {
         min-height: 96px;
         flex-direction: row;
@@ -921,6 +1282,23 @@ function manageHtml(): string {
             <span id="count">0/180</span>
           </div>
 
+          <div class="schedule-grid">
+            <div>
+              <label for="preset">Saved opening times</label>
+              <select id="preset">
+                <option value="">Choose a saved time</option>
+              </select>
+            </div>
+            <div>
+              <label for="opening-time">Scheduled open</label>
+              <input id="opening-time" type="time">
+            </div>
+          </div>
+          <label class="check-row" for="save-opening-time">
+            <input id="save-opening-time" type="checkbox">
+            <span>Save this opening time</span>
+          </label>
+
           <button class="save" id="save" type="button">Update Display</button>
           <div class="notice" id="notice" role="status" aria-live="polite"></div>
         </div>
@@ -937,6 +1315,10 @@ function manageHtml(): string {
           <div class="detail">
             <div class="detail-title">Message</div>
             <div class="detail-value" id="current-message">No message</div>
+          </div>
+          <div class="detail">
+            <div class="detail-title">Scheduled Open</div>
+            <div class="detail-value" id="current-scheduled-open">Not scheduled</div>
           </div>
           <div class="detail">
             <div class="detail-title">Last Updated</div>
@@ -961,6 +1343,9 @@ function manageHtml(): string {
     const count = document.getElementById('count');
     const save = document.getElementById('save');
     const notice = document.getElementById('notice');
+    const preset = document.getElementById('preset');
+    const openingTime = document.getElementById('opening-time');
+    const saveOpeningTime = document.getElementById('save-opening-time');
     const updatedFormatter = new Intl.DateTimeFormat('en-US', {
       timeZone: 'America/New_York',
       month: 'short',
@@ -972,6 +1357,14 @@ function manageHtml(): string {
 
     function titleFor(status) {
       return status === 'capacity' ? 'At Capacity' : status.charAt(0).toUpperCase() + status.slice(1);
+    }
+
+    function renderPresets(presets, selectedTime) {
+      const placeholder = '<option value="">Choose a saved time</option>';
+      preset.innerHTML = placeholder + (presets || [])
+        .map((item) => '<option value="' + item.timeValue + '">' + item.label + '</option>')
+        .join('');
+      preset.value = selectedTime || '';
     }
 
     function select(status) {
@@ -994,10 +1387,17 @@ function manageHtml(): string {
       select(data.storedStatus || data.status);
       message.value = data.storedMessage || '';
       updateCount();
+      const scheduledTimeValue = data.scheduledOpen ? data.scheduledOpen.timeValue : '';
+      openingTime.value = scheduledTimeValue;
+      saveOpeningTime.checked = false;
+      renderPresets(data.openingTimePresets || [], scheduledTimeValue);
 
       document.getElementById('dot').dataset.status = data.status;
       document.getElementById('current-label').textContent = data.label || titleFor(data.status);
       document.getElementById('current-message').textContent = data.storedMessage || 'No message';
+      document.getElementById('current-scheduled-open').textContent = data.scheduledOpen
+        ? data.scheduledOpen.label
+        : 'Not scheduled';
       document.getElementById('updated-by').textContent = data.updatedBy || 'Library staff';
       document.getElementById('stale').dataset.visible = data.isStale ? 'true' : 'false';
 
@@ -1020,7 +1420,12 @@ function manageHtml(): string {
         const response = await fetch('/manage/api/status', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ status: selected, message: message.value }),
+          body: JSON.stringify({
+            status: selected,
+            message: message.value,
+            scheduledOpenTime: openingTime.value || null,
+            saveOpeningTime: saveOpeningTime.checked,
+          }),
         });
         const body = await response.json();
         if (!response.ok) throw new Error(body.error || 'Update failed');
@@ -1037,6 +1442,11 @@ function manageHtml(): string {
       button.addEventListener('click', () => select(button.dataset.value));
     }
     message.addEventListener('input', updateCount);
+    preset.addEventListener('change', () => {
+      if (preset.value) {
+        openingTime.value = preset.value;
+      }
+    });
     save.addEventListener('click', submit);
 
     refresh().catch((error) => setNotice(error instanceof Error ? error.message : 'Could not load status', true));
